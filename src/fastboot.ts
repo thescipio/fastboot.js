@@ -118,55 +118,110 @@ export class FastbootDevice {
             throw new UsbError("Attempted to connect to null device");
         }
 
-        // Validate device
-        let ife = this.device!.configurations[0].interfaces[0].alternates[0];
-        if (ife.endpoints.length !== 2) {
-            throw new UsbError("Interface has wrong number of endpoints");
-        }
-
-        this.epIn = null;
-        this.epOut = null;
-        for (let endpoint of ife.endpoints) {
-            common.logVerbose("Checking endpoint:", endpoint);
-            if (endpoint.type !== "bulk") {
-                throw new UsbError("Interface endpoint is not bulk");
-            }
-
-            if (endpoint.direction === "in") {
-                if (this.epIn === null) {
-                    this.epIn = endpoint.endpointNumber;
-                } else {
-                    throw new UsbError("Interface has multiple IN endpoints");
-                }
-            } else if (endpoint.direction === "out") {
-                if (this.epOut === null) {
-                    this.epOut = endpoint.endpointNumber;
-                } else {
-                    throw new UsbError("Interface has multiple OUT endpoints");
-                }
-            }
-        }
-        common.logVerbose("Endpoints: in =", this.epIn, ", out =", this.epOut);
-
         try {
             await this.device!.open();
-            // Opportunistically reset to fix issues on some platforms
-            try {
-                await this.device!.reset();
-            } catch (error) {
-                /* Failed = doesn't support reset */
-            }
-
-            await this.device!.selectConfiguration(1);
-            await this.device!.claimInterface(0); // fastboot
         } catch (error) {
-            // Propagate exception from waitForConnect()
-            if (this._connectReject !== null) {
-                this._connectReject(error);
-                this._connectResolve = null;
-                this._connectReject = null;
-            }
+            common.logDebug("Failed to open device:", error);
+            throw error;
+        }
 
+        // On Linux, reset() can cause the device to disconnect or become busy.
+        // We'll skip it unless we're on a platform known to need it, or just remove it
+        // as it's often more trouble than it's worth in WebUSB.
+        /*
+        try {
+            await this.device!.reset();
+        } catch (error) {
+            // Failed = doesn't support reset
+        }
+        */
+
+        // Find the fastboot interface
+        let interfaceNumber = -1;
+        let epIn = -1;
+        let epOut = -1;
+
+        // Ensure we have a configuration selected
+        if (this.device!.configuration === null) {
+            try {
+                await this.device!.selectConfiguration(1);
+            } catch (error) {
+                common.logDebug("Failed to select configuration 1:", error);
+            }
+        }
+
+        const configuration = this.device!.configuration;
+        if (!configuration) {
+            throw new UsbError("Device has no active configuration");
+        }
+
+        for (const iface of configuration.interfaces) {
+            for (const alt of iface.alternates) {
+                if (
+                    alt.interfaceClass === FASTBOOT_USB_CLASS &&
+                    alt.interfaceSubclass === FASTBOOT_USB_SUBCLASS &&
+                    alt.interfaceProtocol === FASTBOOT_USB_PROTOCOL
+                ) {
+                    interfaceNumber = iface.interfaceNumber;
+                    
+                    for (const endpoint of alt.endpoints) {
+                        if (endpoint.type !== "bulk") continue;
+                        if (endpoint.direction === "in") {
+                            epIn = endpoint.endpointNumber;
+                        } else if (endpoint.direction === "out") {
+                            epOut = endpoint.endpointNumber;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (interfaceNumber !== -1) break;
+        }
+
+        if (interfaceNumber === -1) {
+            // Fallback to searching all configurations if the current one doesn't match
+            for (const config of this.device!.configurations) {
+                for (const iface of config.interfaces) {
+                    for (const alt of iface.alternates) {
+                        if (
+                            alt.interfaceClass === FASTBOOT_USB_CLASS &&
+                            alt.interfaceSubclass === FASTBOOT_USB_SUBCLASS &&
+                            alt.interfaceProtocol === FASTBOOT_USB_PROTOCOL
+                        ) {
+                            // Found it in another configuration, select it
+                            await this.device!.selectConfiguration(config.configurationValue);
+                            interfaceNumber = iface.interfaceNumber;
+                            for (const endpoint of alt.endpoints) {
+                                if (endpoint.type !== "bulk") continue;
+                                if (endpoint.direction === "in") {
+                                    epIn = endpoint.endpointNumber;
+                                } else if (endpoint.direction === "out") {
+                                    epOut = endpoint.endpointNumber;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (interfaceNumber !== -1) break;
+                }
+                if (interfaceNumber !== -1) break;
+            }
+        }
+
+        if (interfaceNumber === -1 || epIn === -1 || epOut === -1) {
+            throw new UsbError("Could not find fastboot interface on this device");
+        }
+
+        this.epIn = epIn;
+        this.epOut = epOut;
+        common.logVerbose(`Found interface ${interfaceNumber}: in=${epIn}, out=${epOut}`);
+
+        try {
+            await this.device!.claimInterface(interfaceNumber);
+        } catch (error) {
+            // If we can't claim it, it might be because the kernel driver is active.
+            // On some platforms, we might need to call claimInterface again or wait.
+            common.logDebug(`Failed to claim interface ${interfaceNumber}:`, error);
             throw error;
         }
 
